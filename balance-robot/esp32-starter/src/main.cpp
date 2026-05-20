@@ -241,17 +241,14 @@ void loop() {
 #include <Adafruit_Sensor.h>
 #include <step.h>
 
-// ── LQR gains  u = -(K_theta*theta + K_theta_dot*theta_dot + K_x*x + K_x_dot*x_dot)
-// UPDATE these with your identified values
-const float K_THETA     = 20.5f/2;
-const float K_THETA_DOT = 2.43f/2;
-const float K_X         = 0.125f/2;
-const float K_X_DOT     = 0.5f/2;
+// ── LQR gains  u = -(K_theta*theta + K_theta_dot*theta_dot)
+const float K_THETA     = -80.7f/2; //108.7
+const float K_THETA_DOT = -9.9f/2;//9.9
 
-const float U_MAX        = 50.0f;   // motor speed saturation (rad/s)
-const float WHEEL_RADIUS = 0.034f;  // metres
-const float GYRO_BIAS    = 0.0f;    // rad/s — update from noise analysis
+const float U_MAX        = 50.0f;  // motor speed saturation (rad/s)
+const float GYRO_BIAS    = 0.008f;   // rad/s — update from noise analysis
 const float CF_ALPHA     = 0.98f;
+const float THETA_OFFSET = 0.1f;   // rad — tune until theta reads 0 when balanced
 
 // ── Pins ──────────────────────────────────────────────────────────────────────
 const int STEPPER1_DIR_PIN  = 16;
@@ -262,9 +259,16 @@ const int STEPPER_EN_PIN    = 15;
 const int TOGGLE_PIN        = 32;
 
 const int   LOOP_INTERVAL_MS    = 10;
-const int   PRINT_INTERVAL_MS   = 50;   // 20 Hz log rate (separate from 100 Hz control)
+const int   PRINT_INTERVAL_MS   = 50;
 const int   STEPPER_INTERVAL_US = 20;
 const float DT = LOOP_INTERVAL_MS / 1000.0f;
+
+// ── Capture buffer (3 s at 100 Hz) ───────────────────────────────────────────
+const int CAP_SAMPLES = 300;
+struct Sample { uint32_t t; float theta; float theta_dot; float u; };
+static Sample capBuf[CAP_SAMPLES];
+static int    capIdx   = 0;
+static bool   capActive = false;
 
 // ── Objects ───────────────────────────────────────────────────────────────────
 BluetoothSerial BT;
@@ -285,6 +289,19 @@ template<typename T> void logPrint(T v, int dp)  { Serial.print(v, dp);  BT.prin
 template<typename T> void logPrintln(T v)        { Serial.println(v);    BT.println(v); }
 template<typename T> void logPrintln(T v, int dp){ Serial.println(v,dp); BT.println(v,dp); }
 
+void dumpCapture()
+{
+  logPrintln("--- CAPTURE START ---");
+  logPrintln("t_ms,theta,theta_dot,u");
+  for (int i = 0; i < CAP_SAMPLES; i++) {
+    logPrint(capBuf[i].t);          logPrint(',');
+    logPrint(capBuf[i].theta,   5); logPrint(',');
+    logPrint(capBuf[i].theta_dot,5);logPrint(',');
+    logPrintln(capBuf[i].u,     5);
+  }
+  logPrintln("--- CAPTURE END ---");
+}
+
 void setup()
 {
   Serial.begin(115200);
@@ -304,7 +321,6 @@ void setup()
     while (1) delay(10);
   }
 
-  // High acceleration so motors track the control signal with minimal lag
   step1.setAccelerationRad(100.0f);
   step2.setAccelerationRad(100.0f);
 
@@ -316,7 +332,7 @@ void setup()
   while (digitalRead(0) == HIGH) delay(10);
   while (digitalRead(0) == LOW)  delay(10);
 
-  logPrintln("t_ms,theta,theta_dot,x,x_dot,u");
+  logPrintln("Running. Send 'c' to capture 3s of data.");
 }
 
 void loop()
@@ -328,36 +344,53 @@ void loop()
   if (millis() < loopTimer) return;
   loopTimer += LOOP_INTERVAL_MS;
 
+  // ── Serial trigger: send 'c' from the laptop to start a capture ──────────
+  if (!capActive && (Serial.available() || BT.available())) {
+    char ch = Serial.available() ? Serial.read() : BT.read();
+    if (ch == 'c') {
+      capActive = true;
+      capIdx    = 0;
+    }
+  }
+
   sensors_event_t a, g, temp;
   mpu.getEvent(&a, &g, &temp);
 
   float theta_dot   = g.gyro.y - GYRO_BIAS;
-  float theta_accel = a.acceleration.z / 9.81f;
+  float theta_accel = a.acceleration.z / 9.81f - THETA_OFFSET;
   theta_filt = CF_ALPHA * (theta_filt + theta_dot * DT)
              + (1.0f - CF_ALPHA) * theta_accel;
 
-  float x     = step1.getPositionRad() * WHEEL_RADIUS;
-  float x_dot = step1.getSpeedRad()    * WHEEL_RADIUS;
+  static float theta_dot_filt = 0.0f;
+  const float GYRO_LPF = 0.8f;  // lower = more smoothing, try 0.7–0.9
 
-  // LQR control law
-  float u = -(K_THETA     * theta_filt
-            + K_THETA_DOT * theta_dot
-            + K_X         * x
-            + K_X_DOT     * x_dot);
+  theta_dot_filt = GYRO_LPF * theta_dot_filt + (1.0f - GYRO_LPF) * theta_dot;
 
+  float u = -(K_THETA * theta_filt + K_THETA_DOT * theta_dot_filt);
+
+ // float u = -(K_THETA * theta_filt + K_THETA_DOT * theta_dot);
+ 
   u = constrain(u, -U_MAX, U_MAX);
 
   step1.setTargetSpeedRad(u);
   step2.setTargetSpeedRad(-u);
 
-  if (millis() >= printTimer) {
+  // ── Store sample if capturing ─────────────────────────────────────────────
+  if (capActive) {
+    capBuf[capIdx++] = { millis(), theta_filt, theta_dot, u };
+    if (capIdx >= CAP_SAMPLES) {
+      capActive = false;
+      dumpCapture();
+    }
+  }
+
+  // ── Regular live print ────────────────────────────────────────────────────
+  if (!capActive && millis() >= printTimer) {
     printTimer += PRINT_INTERVAL_MS;
-    logPrint("t=");        logPrint(millis());
-    logPrint(" th=");      logPrint(theta_filt, 4);
-    logPrint(" th_d=");    logPrint(theta_dot,  4);
-    logPrint(" x=");       logPrint(x,          4);
-    logPrint(" x_d=");     logPrint(x_dot,      4);
-    logPrint(" u=");       logPrintln(u,        4);
+    logPrint("t=");     logPrint(millis());
+    logPrint(" th=");   logPrint(theta_filt, 4);
+    logPrint(" th_d="); logPrint(theta_dot,  4);
+    logPrint(" u=");    logPrintln(u,        4);
   }
 }
 
