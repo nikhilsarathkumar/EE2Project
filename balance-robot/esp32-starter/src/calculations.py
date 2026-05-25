@@ -45,8 +45,8 @@ B = np.array([[0    ],
 # Q[0,0]: angle penalty — larger = stiffer response to tilt
 # Q[1,1]: rate penalty  — larger = more damping
 # R:      control effort penalty — smaller = more aggressive
-Q = np.diag([300.0, 2.0])
-R = np.array([[0.01]])
+Q = np.diag([30.0, 2000.0])
+R = np.array([[10.0]])
 
 # ── Continuous-time LQR (CARE) ────────────────────────────────────────────────
 Pc = solve_continuous_are(A, B, Q, R)
