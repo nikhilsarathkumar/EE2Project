@@ -5,14 +5,16 @@
 #include <Adafruit_Sensor.h>
 #include <step.h>
 
+// ── Controller gains ────────────────────────────────────────────────────────
+const float K_THETA     = -70.0f; //17
+const float K_THETA_DOT = -50.0f; // 15
 
-const float K_THETA     = -15.0f; //15
-const float K_THETA_DOT = -6.5f; // 7.5
-
+// ── Controller limits ───────────────────────────────────────────────────────
 const float U_MAX        = 50.0f;  // motor speed saturation (rad/s)
-const float GYRO_BIAS    = -0.008f;   
+const float GYRO_BIAS    = -0.015f;
 const float CF_ALPHA     = 0.98f;
-const float THETA_OFFSET = 0.1f;  
+const float THETA_OFFSET = 0.1147f;  
+const float GYRO_LPF = 0.9f;  // lower = more smoothing, try 0.7–0.9
 
 // ── Pins ──────────────────────────────────────────────────────────────────────
 const int STEPPER1_DIR_PIN  = 16;
@@ -59,9 +61,10 @@ void setup()
     Serial.println("MPU6050 not found");
     while (1) delay(10);
   }
+
   mpu.setAccelerometerRange(MPU6050_RANGE_2_G);
   mpu.setGyroRange(MPU6050_RANGE_250_DEG);
-  mpu.setFilterBandwidth(MPU6050_BAND_44_HZ);
+  mpu.setFilterBandwidth(MPU6050_BAND_10_HZ);
 
   if (!ITimer.attachInterruptInterval(STEPPER_INTERVAL_US, TimerHandler)) {
     Serial.println("Stepper ISR failed");
@@ -87,6 +90,7 @@ void loop()
   static unsigned long loopTimer  = millis();
   static unsigned long printTimer = millis();
   static float theta_filt = 0.0f;
+  static float theta_dot_filt = 0.0f;
 
   if (millis() < loopTimer) return;
   loopTimer += LOOP_INTERVAL_MS;
@@ -94,21 +98,19 @@ void loop()
   sensors_event_t a, g, temp;
   mpu.getEvent(&a, &g, &temp);
 
-  float theta_dot   = g.gyro.y - GYRO_BIAS;
+  static float gyrobuf[3] = {0, 0, 0};
+  static uint8_t gyrobuf_i = 0;
+  gyrobuf[gyrobuf_i] = g.gyro.y;
+  gyrobuf_i = (gyrobuf_i + 1) % 3;
+  float ga = gyrobuf[0], gb = gyrobuf[1], gc = gyrobuf[2];
+  float gyro_med = max(min(ga, gb), min(max(ga, gb), gc));
+
+  float theta_dot   = gyro_med - GYRO_BIAS;
   float theta_accel = a.acceleration.z / 9.81f - THETA_OFFSET;
-  //theta_filt = CF_ALPHA * (theta_filt + theta_dot * DT)
-  //           + (1.0f - CF_ALPHA) * theta_accel;
 
-  float acc_mag = sqrtf(a.acceleration.x*a.acceleration.x + a.acceleration.y*a.acceleration.y + a.acceleration.z*a.acceleration.z);
-
-  float cf_accel_weight = (acc_mag > 8.0f && acc_mag < 11.5f) ? (1.0f - CF_ALPHA) : 0.0f;
-
-  theta_filt = CF_ALPHA * (theta_filt + theta_dot * DT) + cf_accel_weight * theta_accel;
-
-  static float theta_dot_filt = 0.0f;
-  const float GYRO_LPF = 0.8f;  // lower = more smoothing, try 0.7–0.9
 
   theta_dot_filt = GYRO_LPF * theta_dot_filt + (1.0f - GYRO_LPF) * theta_dot;
+  theta_filt = CF_ALPHA * (theta_filt + theta_dot_filt * DT) + (1.0f - CF_ALPHA) * theta_accel;
 
   float u = -(K_THETA * theta_filt + K_THETA_DOT * theta_dot_filt);
  
@@ -122,12 +124,13 @@ void loop()
     printTimer += PRINT_INTERVAL_MS;
     logPrint("t=");     logPrint(millis());
     logPrint(" th=");   logPrint(theta_filt, 4);
-    logPrint(" th_d="); logPrint(theta_dot,  4);
+    logPrint(" th_d="); logPrint(theta_dot_filt,  4);
     logPrint(" u=");    logPrintln(u,        4);
-    logPrint(" a.acceleration.z=");    logPrintln(a.acceleration.z, 4);
   }
 }
 
 
 
 //python -m serial.tools.miniterm COM5 115200
+//-0.25, 1.2
+//1.2, 2.5
