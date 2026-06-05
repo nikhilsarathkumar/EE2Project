@@ -56,10 +56,12 @@ def main():
     if not rows:
         sys.exit("No parseable lines found.")
 
-    t_ms = [r['t']                        for r in rows]
-    td_r = [r.get('td_r', float('nan'))   for r in rows]
-    th_d = [r.get('th_d', float('nan'))   for r in rows]
-    th   = [r.get('th',   float('nan'))   for r in rows]
+    t_ms   = [r['t']                         for r in rows]
+    td_r   = [r.get('td_r',  float('nan'))  for r in rows]
+    th_d   = [r.get('th_d',  float('nan'))  for r in rows]
+    th     = [r.get('th',    float('nan'))  for r in rows]
+    kf_th  = [r.get('kf_th', float('nan'))  for r in rows]
+    kf_td  = [r.get('kf_td', float('nan'))  for r in rows]
 
     # Normalise time to start at 0
     t0 = t_ms[0]
@@ -78,20 +80,22 @@ def main():
 
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 8), sharex=True)
 
-    ax1.plot(t_s, td_r,    color='steelblue',   lw=0.8, alpha=0.6, label='td_r     (raw)')
-    ax1.plot(t_s, th_d,    color='firebrick',   lw=1.5,             label='th_d     (causal IIR, robot)')
-    ax1.plot(t_s, td_ideal, color='limegreen',  lw=1.5,             label=f'td_ideal (Savitzky-Golay {SAVGOL_WINDOW_MS}ms)')
+    ax1.plot(t_s, td_r,    color='steelblue',  lw=0.8, alpha=0.5, label='td_r     (raw)')
+    ax1.plot(t_s, th_d,    color='firebrick',  lw=1.5,            label='th_d     (IIR filtered)')
+    ax1.plot(t_s, td_ideal, color='limegreen', lw=1.5,            label=f'td_ideal (Savitzky-Golay {SAVGOL_WINDOW_MS}ms)')
+    ax1.plot(t_s, kf_td,   color='mediumpurple', lw=1.5,          label='kf_td    (Kalman)')
     ax1.axhline(0, color='k', lw=0.5, ls='--')
     ax1.set_ylabel('Angular rate (rad/s)')
-    ax1.set_title('θ̇ raw vs filtered')
+    ax1.set_title('θ̇ raw vs filtered vs Kalman')
     ax1.legend()
     ax1.grid(alpha=0.3)
 
-    ax2.plot(t_s, th, color='darkorange', lw=1.5, label='th  (tilt angle)')
+    ax2.plot(t_s, th,    color='darkorange',   lw=1.5, label='th    (CF tilt angle)')
+    ax2.plot(t_s, kf_th, color='mediumpurple', lw=1.5, label='kf_th (Kalman tilt angle)')
     ax2.axhline(0, color='k', lw=0.5, ls='--')
     ax2.set_xlabel('Time (s)')
     ax2.set_ylabel('Angle (rad)')
-    ax2.set_title('θ tilt angle')
+    ax2.set_title('θ tilt angle — CF vs Kalman')
     ax2.legend()
     ax2.grid(alpha=0.3)
 

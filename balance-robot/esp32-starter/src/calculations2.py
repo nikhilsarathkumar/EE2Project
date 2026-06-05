@@ -56,7 +56,7 @@ B = np.array([[0    ],
 #   x_dot    : damping on forward drift
 #   theta    : tilt stiffness
 #   theta_dot: tilt damping
-Q = np.diag([0.0, 1000.0, 30000.0, 100000.0])
+Q = np.diag([0.0, 0000.0, 30000.0, 100000.0])
 R = np.array([[1.0]])
 
 # ── Continuous-time LQR (reference) ───────────────────────────────────────────
