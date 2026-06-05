@@ -6,15 +6,22 @@
 #include <step.h>
 
 // ── Controller gains ────────────────────────────────────────────────────────
-const float K_THETA     = -70.0f; //17
-const float K_THETA_DOT = -50.0f; // 15
+const float K_THETA     = -120.0f; //160    100
+const float K_THETA_DOT = -100.0f; //55     100
+const float K_XDOT      =   0.0f; // velocity gain (m/s → rad/s) — tune from 0
+const float VEL_CMD     =   0.05f; // target speed when w/s held (m/s)
+const float THETA_CMD   =   0.015f; // lean angle when w/s held (rad, ~1.1°)
+const float THETA_RAMP  =   0.0005f; // rad per 10ms loop → ~200ms to full lean
+const float VEL_RAMP    =   0.003f;  // m/s per 10ms loop → ~50ms to full speed
 
-// ── Controller limits ───────────────────────────────────────────────────────
-const float U_MAX        = 50.0f;  // motor speed saturation (rad/s)
-const float GYRO_BIAS    = -0.015f;
-const float CF_ALPHA     = 0.98f;
-const float THETA_OFFSET = 0.1147f;  
-const float GYRO_LPF = 0.9f;  // lower = more smoothing, try 0.7–0.9
+
+// ── Controller settings ───────────────────────────────────────────────────────
+const float U_MAX          = 30.0f;
+const float GYRO_BIAS      = -0.014f;
+const float CF_ALPHA       = 0.98f;
+const float THETA_OFFSET   = 0.1247f;
+const float GYRO_LPF       = 0.95f;
+const float COM_HEIGHT_M   = 0.105f;  // ← height of centre of mass above wheel axle
 
 // ── Pins ──────────────────────────────────────────────────────────────────────
 const int STEPPER1_DIR_PIN  = 16;
@@ -28,8 +35,9 @@ const int   LOOP_INTERVAL_MS    = 10;
 const int   PRINT_INTERVAL_MS   = 50;
 const int   STEPPER_INTERVAL_US = 20;
 const float DT = LOOP_INTERVAL_MS / 1000.0f;
+const float WHEEL_RADIUS_M      = 0.034f;  // ← measure your wheel radius in metres
 
-static bool   capActive = false;
+static bool capActive = false;
 
 // ── Objects ───────────────────────────────────────────────────────────────────
 BluetoothSerial BT;
@@ -45,10 +53,10 @@ bool TimerHandler(void *)
   return true;
 }
 
-template<typename T> void logPrint(T v)          { Serial.print(v);      BT.print(v); }
-template<typename T> void logPrint(T v, int dp)  { Serial.print(v, dp);  BT.print(v, dp); }
-template<typename T> void logPrintln(T v)        { Serial.println(v);    BT.println(v); }
-template<typename T> void logPrintln(T v, int dp){ Serial.println(v,dp); BT.println(v,dp); }
+template<typename T> void logPrint(T v)           { Serial.print(v);      BT.print(v); }
+template<typename T> void logPrint(T v, int dp)   { Serial.print(v, dp);  BT.print(v, dp); }
+template<typename T> void logPrintln(T v)         { Serial.println(v);    BT.println(v); }
+template<typename T> void logPrintln(T v, int dp) { Serial.println(v,dp); BT.println(v,dp); }
 
 
 void setup()
@@ -81,23 +89,40 @@ void setup()
   Serial.println("Press BOOT to start controller...");
   while (digitalRead(0) == HIGH) delay(10);
   while (digitalRead(0) == LOW)  delay(10);
-
-  logPrintln("Running. Send 'c' to capture 3s of data.");
 }
 
 void loop()
 {
   static unsigned long loopTimer  = millis();
   static unsigned long printTimer = millis();
-  static float theta_filt = 0.0f;
+  static float theta_filt     = 0.0f;
   static float theta_dot_filt = 0.0f;
+  static float vel_filt       = 0.0f;
+  static float theta_filt_f   = 0.0f;   // shadow filter: GYRO_LPF = 0.7
+  static float theta_dot_f    = 0.0f;
+  static char          keyState   = '-';   // 'w', 's', or '-'
+  static unsigned long lastKeyMs  = 0;
+  static const unsigned long KEY_TIMEOUT_MS = 150;
 
   if (millis() < loopTimer) return;
   loopTimer += LOOP_INTERVAL_MS;
 
+  // ── Bluetooth / Serial keyboard input (runs at 100 Hz) ───────────────────
+  int ch = -1;
+  if      (BT.available())     ch = BT.read();
+  else if (Serial.available()) ch = Serial.read();
+  if (ch != -1) {
+    char c = (char)ch;
+    if      (c == 'w' || c == 'W') { keyState = 'w'; lastKeyMs = millis(); }
+    else if (c == 's' || c == 'S') { keyState = 's'; lastKeyMs = millis(); }
+    else                             keyState = '-';
+  }
+  if (keyState != '-' && (millis() - lastKeyMs) > KEY_TIMEOUT_MS) keyState = '-';
+
   sensors_event_t a, g, temp;
   mpu.getEvent(&a, &g, &temp);
 
+  // 3-sample median filter on raw gyro
   static float gyrobuf[3] = {0, 0, 0};
   static uint8_t gyrobuf_i = 0;
   gyrobuf[gyrobuf_i] = g.gyro.y;
@@ -106,31 +131,59 @@ void loop()
   float gyro_med = max(min(ga, gb), min(max(ga, gb), gc));
 
   float theta_dot   = gyro_med - GYRO_BIAS;
-  float theta_accel = a.acceleration.z / 9.81f - THETA_OFFSET;
-
+  float theta_accel = asinf(constrain(a.acceleration.z / 9.81f, -1.0f, 1.0f)) - THETA_OFFSET;
 
   theta_dot_filt = GYRO_LPF * theta_dot_filt + (1.0f - GYRO_LPF) * theta_dot;
-  theta_filt = CF_ALPHA * (theta_filt + theta_dot_filt * DT) + (1.0f - CF_ALPHA) * theta_accel;
+  theta_filt     = CF_ALPHA * (theta_filt + theta_dot_filt * DT) + (1.0f - CF_ALPHA) * theta_accel;
 
-  float u = -(K_THETA * theta_filt + K_THETA_DOT * theta_dot_filt);
- 
-  u = constrain(u, -U_MAX, U_MAX);
+  // Shadow filter at GYRO_LPF = 0.7 (log-only, no control effect)
+  static const float LPF_FAST = 0.7f;
+  theta_dot_f = LPF_FAST * theta_dot_f + (1.0f - LPF_FAST) * theta_dot;
+  theta_filt_f = CF_ALPHA * (theta_filt_f + theta_dot_f * DT) + (1.0f - CF_ALPHA) * theta_accel;
+
+  // Body velocity: wheel surface speed + pendulum tip correction
+  // v_body = r*omega_wheel + L*theta_dot*cos(theta)  (exact for rigid body)
+  float vel_raw = step1.getSpeedRad() * WHEEL_RADIUS_M  + COM_HEIGHT_M * theta_dot_filt * cosf(theta_filt);
+  vel_filt = GYRO_LPF * vel_filt + (1.0f - GYRO_LPF) * vel_raw;
+
+  static float vel_target   = 0.0f;
+  static float theta_target = 0.0f;
+
+  float vel_desired   = (keyState == 'w') ?  VEL_CMD   : (keyState == 's') ? -VEL_CMD   : 0.0f;
+  float theta_desired = (keyState == 'w') ?  THETA_CMD : (keyState == 's') ? -THETA_CMD : 0.0f;
+
+  // Slew targets toward desired at fixed rate
+  if      (theta_target < theta_desired - THETA_RAMP) theta_target += THETA_RAMP;
+  else if (theta_target > theta_desired + THETA_RAMP) theta_target -= THETA_RAMP;
+  else                                                 theta_target  = theta_desired;
+
+  if      (vel_target < vel_desired - VEL_RAMP) vel_target += VEL_RAMP;
+  else if (vel_target > vel_desired + VEL_RAMP) vel_target -= VEL_RAMP;
+  else                                           vel_target  = vel_desired;
+
+  float u_th   = -K_THETA     * (theta_filt - theta_target);
+  float u_thd  = -K_THETA_DOT * theta_dot_filt;
+  float u_vel  = -K_XDOT      * (vel_filt - vel_target);
+  float u_raw  = u_th + u_thd + u_vel;
+  float u      = constrain(u_raw, -U_MAX, U_MAX);
 
   step1.setTargetSpeedRad(u);
   step2.setTargetSpeedRad(-u);
 
-  // ── Regular live print ────────────────────────────────────────────────────
   if (!capActive && millis() >= printTimer) {
     printTimer += PRINT_INTERVAL_MS;
-    logPrint("t=");     logPrint(millis());
-    logPrint(" th=");   logPrint(theta_filt, 4);
-    logPrint(" th_d="); logPrint(theta_dot_filt,  4);
-    logPrint(" u=");    logPrintln(u,        4);
+    logPrint("t=");      logPrint(millis());
+    logPrint(" th=");    logPrint(theta_filt,      4);
+    logPrint(" th_d=");  logPrint(theta_dot_filt,   4);
+    logPrint(" td_r=");  logPrint(theta_dot,    4);
+    logPrint(" vel=");   logPrint(vel_filt,        4);
+    logPrint(" u_th=");  logPrint(u_th,             4);
+    logPrint(" u_thd="); logPrint(u_thd,            4);
+    logPrint(" u_vel="); logPrint(u_vel,            4);
+    logPrint(" u=");     logPrint(u,                4);
+    logPrint(" spd=");   logPrintln(step1.getSpeedRad(), 4);
+    logPrint(" key=");   Serial.println(keyState); BT.println(keyState);
   }
 }
 
-
-
 //python -m serial.tools.miniterm COM5 115200
-//-0.25, 1.2
-//1.2, 2.5

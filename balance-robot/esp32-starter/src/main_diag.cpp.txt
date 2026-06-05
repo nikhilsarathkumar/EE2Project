@@ -1,0 +1,224 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// main_diag.cpp  —  balance-robot diagnostic firmware
+//
+// To use: rename to main.cpp (back up the original), set one mode below, flash.
+// Data streams as CSV over Serial (115200) and BluetoothSerial "BalanceBot_Diag".
+// Capture with:  python -m serial.tools.miniterm --raw COM5 115200 > data.csv
+// ─────────────────────────────────────────────────────────────────────────────
+#include <Arduino.h>
+#include <BluetoothSerial.h>
+#include <TimerInterrupt_Generic.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <step.h>
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  MODE SELECTION — uncomment exactly one
+// ═════════════════════════════════════════════════════════════════════════════
+//#define DIAG_MODE_A       // static noise:    motors disabled, 15 s
+//#define DIAG_MODE_B     // running noise:   motors at FIXED_SPEED_RAD, 15 s
+//#define DIAG_MODE_C     // DLPF sweep:      10→21→44→94 Hz, 5 s each, motors off
+#define DIAG_MODE_D     // push-recovery:   full controller at 100 Hz, runs until reset
+
+#if !defined(DIAG_MODE_A) && !defined(DIAG_MODE_B) && \
+    !defined(DIAG_MODE_C) && !defined(DIAG_MODE_D)
+  #error "Uncomment exactly one DIAG_MODE_x above"
+#endif
+
+// ── Mode-specific settings ────────────────────────────────────────────────────
+#define LOG_DURATION_MS    15000UL  // A/B: total log window (ms)
+#define DLPF_DURATION_MS    5000UL  // C:   per-band window (ms)
+#define FIXED_SPEED_RAD        3.0f // B:   fixed motor speed (rad/s)
+
+// ── Controller constants (Mode D — keep in sync with main.cpp) ────────────────
+static const float K_THETA     = -100.0f;
+static const float K_THETA_DOT =  -55.0f;
+static const float U_MAX        =  20.0f;
+static const float GYRO_BIAS    =  -0.014f;
+static const float CF_ALPHA     =   0.98f;
+static const float THETA_OFFSET =   0.0947f;
+static const float GYRO_LPF     =   0.9f;
+static const float DT           =   0.010f;  // 10 ms loop
+
+// ── Hardware ──────────────────────────────────────────────────────────────────
+static const int STEPPER1_DIR_PIN   = 16;
+static const int STEPPER1_STEP_PIN  = 17;
+static const int STEPPER2_DIR_PIN   =  4;
+static const int STEPPER2_STEP_PIN  = 14;
+static const int STEPPER_EN_PIN     = 15;
+static const int STEPPER_INTERVAL_US = 20;
+
+// ── Objects ───────────────────────────────────────────────────────────────────
+BluetoothSerial  BT;
+ESP32Timer       ITimer(3);
+Adafruit_MPU6050 mpu;
+step step1(STEPPER_INTERVAL_US, STEPPER1_STEP_PIN, STEPPER1_DIR_PIN);
+step step2(STEPPER_INTERVAL_US, STEPPER2_STEP_PIN, STEPPER2_DIR_PIN);
+
+bool TimerHandler(void *) {
+    step1.runStepper();
+    step2.runStepper();
+    return true;
+}
+
+// ── Dual-output helpers ───────────────────────────────────────────────────────
+static void lp(const char *s)      { Serial.print(s);    BT.print(s); }
+static void lp(float v, int dp)    { Serial.print(v,dp); BT.print(v,dp); }
+static void lp(unsigned long v)    { Serial.print(v);    BT.print(v); }
+static void lp(int v)              { Serial.print(v);    BT.print(v); }
+static void lpeol()                { Serial.println();   BT.println(); }
+static void lpc()                  { Serial.print(',');  BT.print(','); }  // comma
+
+// ═════════════════════════════════════════════════════════════════════════════
+void setup() {
+    Serial.begin(115200);
+    BT.begin("BalanceBot_Diag");
+
+    if (!mpu.begin()) {
+        Serial.println("MPU6050 not found"); while (1) delay(10);
+    }
+    mpu.setAccelerometerRange(MPU6050_RANGE_2_G);
+    mpu.setGyroRange(MPU6050_RANGE_250_DEG);
+    mpu.setFilterBandwidth(MPU6050_BAND_10_HZ);   // C overrides this per-band in loop
+
+    if (!ITimer.attachInterruptInterval(STEPPER_INTERVAL_US, TimerHandler)) {
+        Serial.println("Stepper ISR failed"); while (1) delay(10);
+    }
+    step1.setAccelerationRad(500.0f);
+    step2.setAccelerationRad(500.0f);
+
+    // Motors: off for A/C, on for B/D
+    pinMode(STEPPER_EN_PIN, OUTPUT);
+#if defined(DIAG_MODE_A) || defined(DIAG_MODE_C)
+    digitalWrite(STEPPER_EN_PIN, HIGH);  // HIGH = disabled
+#else
+    digitalWrite(STEPPER_EN_PIN, LOW);   // LOW  = enabled
+#endif
+
+    // Mode B: pre-command speed so the ramp finishes before logging starts
+#if defined(DIAG_MODE_B)
+    step1.setTargetSpeedRad( FIXED_SPEED_RAD);
+    step2.setTargetSpeedRad(-FIXED_SPEED_RAD);
+#endif
+
+    // BOOT button wait (same pattern as main.cpp)
+    pinMode(0, INPUT_PULLUP);
+    Serial.println("Press BOOT to start logging...");
+    while (digitalRead(0) == HIGH) delay(10);
+    while (digitalRead(0) == LOW)  delay(10);
+
+    // CSV header
+#if defined(DIAG_MODE_A) || defined(DIAG_MODE_B)
+    lp("t_ms,gyro_raw,accel_raw"); lpeol();
+#elif defined(DIAG_MODE_C)
+    lp("t_ms,gyro_raw,dlpf_hz"); lpeol();
+#elif defined(DIAG_MODE_D)
+    lp("t_ms,theta_filt,theta_dot_filt,theta_dot_raw,u,saturated"); lpeol();
+#endif
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+void loop() {
+    // 100 Hz pacing (same structure as main.cpp)
+    static unsigned long loopTimer = millis();
+    if (millis() < loopTimer) return;
+    loopTimer += 10;
+
+    sensors_event_t a, g, temp;
+    mpu.getEvent(&a, &g, &temp);
+
+// ─────────────────────────────────────────────────────────────────────────────
+#if defined(DIAG_MODE_A) || defined(DIAG_MODE_B)
+// Columns: t_ms, gyro_raw (rad/s, no bias, no filter), accel_raw (az/g, no offset)
+// ─────────────────────────────────────────────────────────────────────────────
+    static bool          done      = false;
+    static unsigned long t0        = 0;
+    if (done) return;
+    if (t0 == 0) t0 = millis();
+
+    unsigned long elapsed = millis() - t0;
+    if (elapsed > LOG_DURATION_MS) {
+        step1.setTargetSpeedRad(0);
+        step2.setTargetSpeedRad(0);
+        lp("# done"); lpeol();
+        done = true;
+        return;
+    }
+
+    lp(elapsed);                           lpc();
+    lp(g.gyro.y,               6);         lpc();
+    lp(a.acceleration.z / 9.81f, 6);       lpeol();
+
+// ─────────────────────────────────────────────────────────────────────────────
+#elif defined(DIAG_MODE_C)
+// Columns: t_ms (elapsed), gyro_raw (rad/s, no bias), dlpf_hz (active band)
+// ─────────────────────────────────────────────────────────────────────────────
+    static const uint8_t bands[] = {
+        MPU6050_BAND_10_HZ, MPU6050_BAND_21_HZ,
+        MPU6050_BAND_44_HZ, MPU6050_BAND_94_HZ
+    };
+    static const int band_hz[] = { 10, 21, 44, 94 };
+    static int           band_idx  = 0;
+    static bool          done      = false;
+    static unsigned long t0        = 0;
+    static unsigned long band_start = 0;
+    if (done) return;
+    if (t0 == 0) { t0 = millis(); band_start = t0; }
+
+    // Advance band when its window expires
+    if (millis() - band_start >= DLPF_DURATION_MS) {
+        band_idx++;
+        if (band_idx >= 4) {
+            lp("# done"); lpeol();
+            done = true;
+            return;
+        }
+        mpu.setFilterBandwidth((mpu6050_bandwidth_t)bands[band_idx]);
+        band_start += DLPF_DURATION_MS;   // aligned advance avoids drift
+    }
+
+    lp((unsigned long)(millis() - t0)); lpc();
+    lp(g.gyro.y, 6);                    lpc();
+    lp(band_hz[band_idx]);              lpeol();
+
+// ─────────────────────────────────────────────────────────────────────────────
+#elif defined(DIAG_MODE_D)
+// Columns: t_ms, theta_filt, theta_dot_filt, theta_dot_raw, u, saturated
+// Runs the real controller; capture a push transient then reset the board.
+// ─────────────────────────────────────────────────────────────────────────────
+    static float         theta_filt     = 0.0f;
+    static float         theta_dot_filt = 0.0f;
+    static unsigned long t0             = 0;
+    if (t0 == 0) t0 = millis();
+
+    // 3-sample median on raw gyro (same as main.cpp)
+    static float   gyrobuf[3] = {0, 0, 0};
+    static uint8_t gyrobuf_i  = 0;
+    gyrobuf[gyrobuf_i] = g.gyro.y;
+    gyrobuf_i = (gyrobuf_i + 1) % 3;
+    float ga = gyrobuf[0], gb = gyrobuf[1], gc = gyrobuf[2];
+    float gyro_med = max(min(ga, gb), min(max(ga, gb), gc));
+
+    float theta_dot_raw = gyro_med - GYRO_BIAS;
+    float theta_accel   = a.acceleration.z / 9.81f - THETA_OFFSET;
+
+    theta_dot_filt = GYRO_LPF * theta_dot_filt + (1.0f - GYRO_LPF) * theta_dot_raw;
+    theta_filt     = CF_ALPHA * (theta_filt + theta_dot_filt * DT)
+                   + (1.0f - CF_ALPHA) * theta_accel;
+
+    float u_raw = (-K_THETA * theta_filt) + (-K_THETA_DOT * theta_dot_filt);
+    float u     = constrain(u_raw, -U_MAX, U_MAX);
+    int   sat   = (fabsf(u_raw) >= U_MAX) ? 1 : 0;
+
+    step1.setTargetSpeedRad( u);
+    step2.setTargetSpeedRad(-u);
+
+    lp((unsigned long)(millis() - t0)); lpc();
+    lp(theta_filt,      6);             lpc();
+    lp(theta_dot_filt,  6);             lpc();
+    lp(theta_dot_raw,   6);             lpc();
+    lp(u,               4);             lpc();
+    lp(sat);                            lpeol();
+
+#endif
+}

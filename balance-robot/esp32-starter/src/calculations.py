@@ -45,8 +45,8 @@ B = np.array([[0    ],
 # Q[0,0]: angle penalty — larger = stiffer response to tilt
 # Q[1,1]: rate penalty  — larger = more damping
 # R:      control effort penalty — smaller = more aggressive
-Q = np.diag([30.0, 2000.0])
-R = np.array([[10.0]])
+Q = np.diag([21000, 10000])
+R = np.array([[1.0]])
 
 # ── Continuous-time LQR (CARE) ────────────────────────────────────────────────
 Pc = solve_continuous_are(A, B, Q, R)
@@ -82,6 +82,51 @@ stable = all(np.abs(cl_eigs_d) < 1.0)
 print(f"  Stable?    = {'YES' if stable else 'NO — increase Q or decrease R'}")
 
 print()
-print("Paste into main_lqr.cpp:")
-print(f"  const float K1 = {Kd[0]:.1f}f;")
-print(f"  const float K2 = {Kd[1]:.1f}f;")
+print("Paste into main.cpp  (use CONTINUOUS gains — model input is force, not speed):")
+print(f"  const float K_THETA     = {Kc[0]:.1f}f;")
+print(f"  const float K_THETA_DOT = {Kc[1]:.1f}f;")
+print()
+print("Discrete gains (theoretically correct for sampled controller,")
+print("but only valid if u = wheel force, not wheel speed):")
+print(f"  K1 = {Kd[0]:.2f},  K2 = {Kd[1]:.2f}")
+
+# ── Inverse LQR — find Q that produces a desired K ───────────────────────────
+# Given K = [K1_abs, K2_abs] (positive, matching |K_THETA|, |K_THETA_DOT| in firmware)
+# and a chosen R, compute the unique diagonal Q such that LQR(A,B,Q,R) → K.
+# Derivation: from K = R⁻¹BᵀP and requiring Q[0,1]=0 (diagonal Q).
+
+K1_target = 160.0   # |K_THETA|   from main.cpp
+K2_target = 100.0   # |K_THETA_DOT| from main.cpp
+R_inv     = 1.0     # free choice — scales Q proportionally
+
+P01 = R_inv * K1_target / b_th
+P11 = R_inv * K2_target / b_th
+P00 = R_inv * K2_target * (K1_target - a_tt / b_th)
+
+Q00 = R_inv * K1_target * (K1_target - 2.0 * a_tt / b_th)
+Q11 = R_inv * (K2_target**2 - 2.0 * K1_target / b_th)
+
+P_inv = np.array([[P00, P01], [P01, P11]])
+Q_inv = np.diag([Q00, Q11])
+
+eigs_P = np.linalg.eigvals(P_inv)
+valid  = np.all(eigs_P > 0) and Q00 >= 0 and Q11 >= 0
+
+print()
+print("=" * 52)
+print(f"Inverse LQR  (K_target = [{K1_target}, {K2_target}])")
+print("=" * 52)
+print(f"  Q[0,0]  = {Q00:.1f}")
+print(f"  Q[1,1]  = {Q11:.1f}")
+print(f"  R       = {R_inv}")
+print(f"  P valid = {'YES' if valid else 'NO — gains too low for this model'}")
+
+if valid:
+    # Verify: forward LQR should recover K_target
+    Pc2 = solve_continuous_are(A, B, Q_inv, np.array([[R_inv]]))
+    K_check = (np.linalg.inv(np.array([[R_inv]])) @ B.T @ Pc2).flatten()
+    print(f"  Verification: Kc = [{K_check[0]:.1f}, {K_check[1]:.1f}]  (should be [{-K1_target:.0f}, {-K2_target:.0f}])")
+    print()
+    print(f"  Use these Q values in the LQR section above to get your target gains.")
+    print(f"  Q = np.diag([{Q00:.1f}, {Q11:.1f}])")
+    print(f"  R = np.array([[{R_inv}]])")
