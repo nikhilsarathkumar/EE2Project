@@ -8,8 +8,8 @@
 // ── Controller gains ────────────────────────────────────────────────────────
 const float K_THETA     = -120.0f; //160    120
 const float K_THETA_DOT = -100.0f; //55     100
-const float K_XDOT      =   0.0f; // velocity gain (m/s → rad/s) — tune from 0
-const float VEL_CMD     =   0.05f; // target speed when w/s held (m/s)
+// K_XDOT removed — velocity regulated solely by outer PI; do not re-enable both
+const float VEL_CMD     =   0.08f; // target speed when w/s held (m/s)
 const float VEL_RAMP    =   0.003f;  // m/s per 10ms loop → ~50ms to full speed
 
 
@@ -24,12 +24,15 @@ static const float KF_AD10 =  0.371830f, KF_AD11 =  1.001859f;
 static const float KF_Q00  =  1e-4f;   // angle
 static const float KF_Q11  =  2e-3f;   // rate
 // Measurement noise variances (tune to match sensor noise floor)
-static const float KF_R_ACCEL =  5000.0f;  // theta from accelerometer
-static const float KF_R_GYRO  =  500.0f;  // theta_dot from gyro
+static const float KF_R_ACCEL =  500000.0f;  // theta from accelerometer
+static const float KF_R_GYRO  =  50000.0f;  // theta_dot from gyro
 
 // ── Controller settings ─────────────────────────────────────────────────────
 const float U_MAX          = 30.0f;
-const float GYRO_BIAS      = -0.014f;
+float       Kp_v           =   1.2;// outer PI: proportional gain (m/s → rad)
+float       Ki_v           =   0.2f;//uter PI: integral gain
+const float THETA_REF_MAX  =  0.04f;   // max commanded lean (rad)
+const float GYRO_BIAS      = -0.02f;
 const float CF_ALPHA       = 0.98f;
 const float THETA_OFFSET   = 0.1167f;
 const float GYRO_LPF       = 0.95f;
@@ -187,18 +190,28 @@ void loop()
   float vel_raw = step1.getSpeedRad() * WHEEL_RADIUS_M  + COM_HEIGHT_M * theta_dot_filt * cosf(theta_filt);
   vel_filt = GYRO_LPF * vel_filt + (1.0f - GYRO_LPF) * vel_raw;
 
-  static float vel_target = 0.0f;
+  static float vel_target   = 0.0f;
+  static float vel_integral = 0.0f;
 
-  float vel_desired = (keyState == 'w') ?  VEL_CMD : (keyState == 's') ? -VEL_CMD : 0.0f;
+  float vel_desired = (keyState == 's') ?  VEL_CMD : (keyState == 'w') ? -VEL_CMD : 0.0f;
 
   if      (vel_target < vel_desired - VEL_RAMP) vel_target += VEL_RAMP;
   else if (vel_target > vel_desired + VEL_RAMP) vel_target -= VEL_RAMP;
   else                                           vel_target  = vel_desired;
 
-  float u_th   = -K_THETA     * theta_filt;
+  // ── Outer PI velocity loop → tilt setpoint ────────────────────────────────
+  float e_v            = vel_target - vel_filt;
+  float theta_ref_raw  = Kp_v * e_v + Ki_v * vel_integral;
+  bool  pi_sat         = fabsf(theta_ref_raw) >= THETA_REF_MAX;
+  bool  pi_wind        = (theta_ref_raw > 0.0f && e_v > 0.0f) || (theta_ref_raw < 0.0f && e_v < 0.0f);
+  if (!(pi_sat && pi_wind)) vel_integral += e_v * DT;
+  if (Ki_v != 0.0f)
+    vel_integral = constrain(vel_integral, -THETA_REF_MAX / fabsf(Ki_v), THETA_REF_MAX / fabsf(Ki_v));
+  float theta_ref = constrain(Kp_v * e_v + Ki_v * vel_integral, -THETA_REF_MAX, THETA_REF_MAX);
+
+  float u_th   = -K_THETA     * (theta_filt - theta_ref);
   float u_thd  = -K_THETA_DOT * theta_dot_filt;
-  float u_vel  = -K_XDOT      * (vel_filt - vel_target);
-  float u_raw  = u_th + u_thd + u_vel;
+  float u_raw  = u_th + u_thd;
   float u      = constrain(u_raw, -U_MAX, U_MAX);
 
   step1.setTargetSpeedRad(u);
@@ -215,7 +228,8 @@ void loop()
     logPrint(" vel=");   logPrint(vel_filt,        4);
     logPrint(" u_th=");  logPrint(u_th,             4);
     logPrint(" u_thd="); logPrint(u_thd,            4);
-    logPrint(" u_vel="); logPrint(u_vel,            4);
+    logPrint(" tref=");  logPrint(theta_ref,          4);
+    logPrint(" vi=");    logPrint(vel_integral,       4);
     logPrint(" u=");     logPrint(u,                4);
     logPrint(" spd=");   logPrintln(step1.getSpeedRad(), 4);
     logPrint(" key=");   Serial.println(keyState); BT.println(keyState);
