@@ -57,7 +57,7 @@ def main():
         sys.exit("No parseable lines found.")
 
     t_ms = [r['t']                        for r in rows]
-    td_r = [r.get('th_r', float('nan'))   for r in rows]
+    td_r = [r.get('td_r', float('nan'))   for r in rows]
     th_d = [r.get('th_d', float('nan'))   for r in rows]
     th   = [r.get('th',   float('nan'))   for r in rows]
 

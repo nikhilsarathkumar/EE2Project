@@ -6,20 +6,18 @@
 #include <step.h>
 
 // ── Controller gains ────────────────────────────────────────────────────────
-const float K_THETA     = -120.0f; //160    100
-const float K_THETA_DOT = -100.0f; //55     100
+const float K_THETA     = -120.4f; //160    120
+const float K_THETA_DOT = -100.3f; //55     100
 const float K_XDOT      =   0.0f; // velocity gain (m/s → rad/s) — tune from 0
 const float VEL_CMD     =   0.05f; // target speed when w/s held (m/s)
-const float THETA_CMD   =   0.015f; // lean angle when w/s held (rad, ~1.1°)
-const float THETA_RAMP  =   0.0005f; // rad per 10ms loop → ~200ms to full lean
 const float VEL_RAMP    =   0.003f;  // m/s per 10ms loop → ~50ms to full speed
 
 
-// ── Controller settings ───────────────────────────────────────────────────────
+// ── Controller settings ─────────────────────────────────────────────────────
 const float U_MAX          = 30.0f;
 const float GYRO_BIAS      = -0.014f;
 const float CF_ALPHA       = 0.98f;
-const float THETA_OFFSET   = 0.1247f;
+const float THETA_OFFSET   = 0.1197f;
 const float GYRO_LPF       = 0.95f;
 const float COM_HEIGHT_M   = 0.105f;  // ← height of centre of mass above wheel axle
 
@@ -98,8 +96,6 @@ void loop()
   static float theta_filt     = 0.0f;
   static float theta_dot_filt = 0.0f;
   static float vel_filt       = 0.0f;
-  static float theta_filt_f   = 0.0f;   // shadow filter: GYRO_LPF = 0.7
-  static float theta_dot_f    = 0.0f;
   static char          keyState   = '-';   // 'w', 's', or '-'
   static unsigned long lastKeyMs  = 0;
   static const unsigned long KEY_TIMEOUT_MS = 150;
@@ -136,32 +132,21 @@ void loop()
   theta_dot_filt = GYRO_LPF * theta_dot_filt + (1.0f - GYRO_LPF) * theta_dot;
   theta_filt     = CF_ALPHA * (theta_filt + theta_dot_filt * DT) + (1.0f - CF_ALPHA) * theta_accel;
 
-  // Shadow filter at GYRO_LPF = 0.7 (log-only, no control effect)
-  static const float LPF_FAST = 0.7f;
-  theta_dot_f = LPF_FAST * theta_dot_f + (1.0f - LPF_FAST) * theta_dot;
-  theta_filt_f = CF_ALPHA * (theta_filt_f + theta_dot_f * DT) + (1.0f - CF_ALPHA) * theta_accel;
 
   // Body velocity: wheel surface speed + pendulum tip correction
   // v_body = r*omega_wheel + L*theta_dot*cos(theta)  (exact for rigid body)
   float vel_raw = step1.getSpeedRad() * WHEEL_RADIUS_M  + COM_HEIGHT_M * theta_dot_filt * cosf(theta_filt);
   vel_filt = GYRO_LPF * vel_filt + (1.0f - GYRO_LPF) * vel_raw;
 
-  static float vel_target   = 0.0f;
-  static float theta_target = 0.0f;
+  static float vel_target = 0.0f;
 
-  float vel_desired   = (keyState == 'w') ?  VEL_CMD   : (keyState == 's') ? -VEL_CMD   : 0.0f;
-  float theta_desired = (keyState == 'w') ?  THETA_CMD : (keyState == 's') ? -THETA_CMD : 0.0f;
-
-  // Slew targets toward desired at fixed rate
-  if      (theta_target < theta_desired - THETA_RAMP) theta_target += THETA_RAMP;
-  else if (theta_target > theta_desired + THETA_RAMP) theta_target -= THETA_RAMP;
-  else                                                 theta_target  = theta_desired;
+  float vel_desired = (keyState == 'w') ?  VEL_CMD : (keyState == 's') ? -VEL_CMD : 0.0f;
 
   if      (vel_target < vel_desired - VEL_RAMP) vel_target += VEL_RAMP;
   else if (vel_target > vel_desired + VEL_RAMP) vel_target -= VEL_RAMP;
   else                                           vel_target  = vel_desired;
 
-  float u_th   = -K_THETA     * (theta_filt - theta_target);
+  float u_th   = -K_THETA     * theta_filt;
   float u_thd  = -K_THETA_DOT * theta_dot_filt;
   float u_vel  = -K_XDOT      * (vel_filt - vel_target);
   float u_raw  = u_th + u_thd + u_vel;
