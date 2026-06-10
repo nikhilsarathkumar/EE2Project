@@ -25,6 +25,20 @@ b   = 0.0                    # viscous friction (N·s/m) — unused
 g   = 9.81                   # m/s²
 Ts  = 0.01                   # sample period (s) — must match LOOP_INTERVAL_MS
 
+
+""""
+
+new (for raph)
+m   = 1.5072
+l   = 0.105
+M   = 0.46
+I   = 0.02
+r   = 0.0335   #same              
+b   = 0.0     #same               
+g   = 9.81      #same             
+Ts  = 0.01   #same
+"""""
+
 # ── Linearised model coefficients ────────────────────────────────────────────
 D0   = (M + m)*(I + m*l**2) - (m*l)**2
 a_tt =  (M + m)*m*g*l / D0       # theta -> theta_ddot  (unstable)
