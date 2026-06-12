@@ -8,22 +8,21 @@
 // ── Controller gains ────────────────────────────────────────────────────────
 const float K_THETA     = -120.0f; //160    120
 const float K_THETA_DOT = -90.0f; //55     100
-// K_XDOT removed — velocity regulated solely by outer PI; do not re-enable both
-const float VEL_CMD     =   0.05f; // target speed when w/s held (m/s)
+const float VEL_CMD     =   0.05f; // target speed when w/s held
 const float VEL_RAMP    =   0.003f;  // m/s per 10ms loop → ~50ms to full speed
-const float TURN_CMD    =   0.5f;  // differential speed offset (rad/s) for a/d turns
+const float TURN_CMD    =   1.0f;  // differential speed offset (rad/s) for a/d turns
 
 
 // ── Controller settings ─────────────────────────────────────────────────────
 const float U_MAX          = 30.0f;
-float       Kp_v           =   1.0f;// outer PI: proportional gain (m/s → rad)
-float       Ki_v           =   0.0f;//outer PI: integral gain
-const float THETA_REF_MAX  =  0.03f;   // max commanded lean (rad)
+float       Kp_v           =   1.0f;
+float       Ki_v           =   0.0f;
+const float THETA_REF_MAX  =  0.08f;   // max commanded lean (rad)
 const float GYRO_BIAS      = -0.007f;
 const float CF_ALPHA       = 0.98f;
 const float THETA_OFFSET   = 0.1050f;
 const float GYRO_LPF       = 0.95f;
-const float COM_HEIGHT_M   = 0.105f;  // ← height of centre of mass above wheel axle
+const float COM_HEIGHT_M   = 0.105f;
 
 // ── Pins ──────────────────────────────────────────────────────────────────────
 const int STEPPER1_DIR_PIN  = 16;
@@ -37,7 +36,7 @@ const int   LOOP_INTERVAL_MS    = 10;
 const int   PRINT_INTERVAL_MS   = 50;
 const int   STEPPER_INTERVAL_US = 20;
 const float DT = LOOP_INTERVAL_MS / 1000.0f;
-const float WHEEL_RADIUS_M      = 0.034f;  // ← measure your wheel radius in metres
+const float WHEEL_RADIUS_M      = 0.034f;
 
 static bool capActive = false;
 
@@ -106,22 +105,22 @@ void loop()
   static char          turnState  = '-';   // 'a', 'd', or '-'
   static unsigned long lastKeyMs  = 0;
   static unsigned long lastTurnMs = 0;
-  static const unsigned long KEY_TIMEOUT_MS = 150;
+  static const unsigned long KEY_TIMEOUT_MS = 1000;
 
   if (millis() < loopTimer) return;
   loopTimer += LOOP_INTERVAL_MS;
 
   // ── Bluetooth / Serial keyboard input (runs at 100 Hz) ───────────────────
-  int ch = -1;
-  if      (BT.available())     ch = BT.read();
-  else if (Serial.available()) ch = Serial.read();
-  if (ch != -1) {
+  // Drain the full buffer each loop so multi-key combos aren't split across
+  // iterations, and ignore unrecognized chars instead of resetting state.
+  while (BT.available() || Serial.available()) {
+    int ch = BT.available() ? BT.read() : Serial.read();
     char c = (char)ch;
-    if      (c == 'w' || c == 'W') { keyState = 'w'; lastKeyMs  = millis(); }
-    else if (c == 's' || c == 'S') { keyState = 's'; lastKeyMs  = millis(); }
+    if      (c == 'w' || c == 'W') { keyState  = 'w'; lastKeyMs  = millis(); }
+    else if (c == 's' || c == 'S') { keyState  = 's'; lastKeyMs  = millis(); }
     else if (c == 'a' || c == 'A') { turnState = 'a'; lastTurnMs = millis(); }
     else if (c == 'd' || c == 'D') { turnState = 'd'; lastTurnMs = millis(); }
-    else { keyState = '-'; turnState = '-'; }
+    else if (c == '-')             { keyState  = '-'; turnState  = '-'; }
   }
   if (keyState  != '-' && (millis() - lastKeyMs)  > KEY_TIMEOUT_MS) keyState  = '-';
   if (turnState != '-' && (millis() - lastTurnMs) > KEY_TIMEOUT_MS) turnState = '-';
@@ -142,15 +141,17 @@ void loop()
 
   theta_dot_filt    = GYRO_LPF  * theta_dot_filt    + (1.0f - GYRO_LPF)  * theta_dot;
   theta_dot_filt_07 = 0.8f      * theta_dot_filt_07 + 0.2f               * theta_dot;
-  theta_filt = CF_ALPHA * (theta_filt + theta_dot_filt * DT) + (1.0f - CF_ALPHA) * theta_accel;
+  float theta_dot_ctrl = (fabsf(theta_dot_filt_07) > 0.3f) ? theta_dot_filt_07 : theta_dot_filt;
+  theta_filt = CF_ALPHA * (theta_filt + theta_dot_ctrl * DT) + (1.0f - CF_ALPHA) * theta_accel;
 
   // Online gyro bias correction: adapt slowly when robot is near-upright and not spinning
   // if (fabsf(theta_filt) < 0.05f && fabsf(theta_dot_filt) < 0.1f)
   //   gyro_bias_est += 0.0003f * (gyro_med - gyro_bias_est);
 
-  // Body velocity: wheel surface speed + pendulum tip correction
-  // v_body = r*omega_wheel + L*theta_dot*cos(theta)  (exact for rigid body)
-  float vel_raw = step1.getSpeedRad() * WHEEL_RADIUS_M  + COM_HEIGHT_M * theta_dot_filt * cosf(theta_filt);
+  // Body velocity: average wheel surface speed + pendulum tip correction.
+  // Average cancels turn_cmd so turning doesn't corrupt the velocity estimate.
+  float wheel_avg = (step1.getSpeedRad() - step2.getSpeedRad()) * 0.5f;
+  float vel_raw = wheel_avg * WHEEL_RADIUS_M + COM_HEIGHT_M * theta_dot_ctrl * cosf(theta_filt);
   vel_filt = GYRO_LPF * vel_filt + (1.0f - GYRO_LPF) * vel_raw;
 
   static float vel_target   = 0.0f;
@@ -187,9 +188,10 @@ void loop()
     logPrint(" th=");     logPrint(theta_filt,    4);
     logPrint(" th_d=");  logPrint(theta_dot_filt,    4);
     logPrint(" th_d7="); logPrint(theta_dot_filt_07, 4);
+    logPrint(" td_c=");  logPrint(theta_dot_ctrl,    4);
     logPrint(" td_r=");  logPrint(theta_dot,       4);
    // logPrint(" gbias="); logPrint(gyro_bias_est,   6);
-   // logPrint(" vel=");   logPrint(vel_filt,        4);
+    logPrint(" vel=");   logPrint(vel_filt,        4);
     logPrint(" u_th=");  logPrint(u_th,             4);
     logPrint(" u_thd="); logPrint(u_thd,            4);
    // logPrint(" tref=");  logPrint(theta_ref,          4);
