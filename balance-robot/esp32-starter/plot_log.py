@@ -52,9 +52,10 @@ def main():
         sys.exit("No parseable lines found.")
 
     t_ms = [r['t']                        for r in rows]
-    td_r = [r.get('td_r', float('nan'))  for r in rows]
-    th_d = [r.get('th_d', float('nan'))  for r in rows]
-    th   = [r.get('th',   float('nan'))  for r in rows]
+    td_r  = [r.get('td_r',  float('nan')) for r in rows]
+    th_d  = [r.get('th_d',  float('nan')) for r in rows]
+    th_d7 = [r.get('th_d7', float('nan')) for r in rows]
+    th    = [r.get('th',    float('nan')) for r in rows]
 
     # Normalise time to start at 0
     t0 = t_ms[0]
@@ -62,8 +63,9 @@ def main():
 
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 8), sharex=True)
 
-    ax1.plot(t_s, td_r, color='steelblue', lw=0.8, alpha=0.5, label='td_r (raw)')
-    ax1.plot(t_s, th_d, color='firebrick', lw=1.5,            label='th_d (IIR filtered)')
+    ax1.plot(t_s, td_r,  color='steelblue', lw=0.8, alpha=0.5, label='td_r (raw)')
+    ax1.plot(t_s, th_d,  color='firebrick', lw=1.5,            label='th_d (LPF=0.95)')
+    ax1.plot(t_s, th_d7, color='seagreen',  lw=1.5,            label='th_d7 (LPF=0.80)')
     ax1.axhline(0, color='k', lw=0.5, ls='--')
     ax1.set_ylabel('Angular rate (rad/s)')
     ax1.set_title('θ̇ raw vs filtered')
